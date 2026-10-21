@@ -50,12 +50,19 @@ contract Bridge {
     /// @notice SBT state roots per DAO (posted by relayer)
     mapping(uint256 => uint256) public sbtRoots; // daoId => sbtRoot
 
+    /// @notice Block number when the SBT root was last posted for a DAO.
+    /// @dev Used to enforce finality before the root can be used to prove votes.
+    mapping(uint256 => uint256) public sbtRootBlock; // daoId => blockNumber
+
     /// @notice Nullifiers used per DAO+proposal (prevents double-voting)
     mapping(uint256 => mapping(uint256 => mapping(uint256 => bool)))
         public nullifiers; // daoId => proposalId => nullifier => used
 
     /// @notice Admin who can update verifier and SBT roots
     address public admin;
+
+    /// @notice Minimum confirmation depth before a posted SBT root is accepted.
+    uint256 public finalityDepth;
 
     /// @notice Chain ID for domain separation in EVMVerifier circuit
     uint256 public chainId;
@@ -70,6 +77,7 @@ contract Bridge {
     error InvalidVoteChoice();
     error ZeroNullifier();
     error SbtRootNotSet();
+    error SbtRootNotFinalized();
     error InvalidVerifier();
     error InvalidAddress();
 
@@ -86,6 +94,7 @@ contract Bridge {
         verifier = _verifier;
         sbtContractAddr = _sbtContractAddr;
         admin = msg.sender;
+        finalityDepth = 0;
         chainId = block.chainid;
     }
 
@@ -113,7 +122,18 @@ contract Bridge {
     function updateSbtRoot(uint256 daoId, uint256 sbtRoot) external {
         if (msg.sender != admin) revert OnlyAdmin();
         sbtRoots[daoId] = sbtRoot;
+        sbtRootBlock[daoId] = block.number;
         emit SbtRootUpdated(daoId, sbtRoot, block.number);
+    }
+
+    /**
+     * @notice Set the confirmation depth required before a posted SBT root can
+     * be used to validate bridge proofs.
+     * @param _finalityDepth Minimum number of blocks that must confirm the root.
+     */
+    function setFinalityDepth(uint256 _finalityDepth) external {
+        if (msg.sender != admin) revert OnlyAdmin();
+        finalityDepth = _finalityDepth;
     }
 
     /**
@@ -167,6 +187,11 @@ contract Bridge {
 
         // Verify the provided sbtRoot matches the posted one
         if (sbtRoot != sbtRoots[daoId]) revert SbtRootNotSet();
+
+        // Enforce confirmation depth to prevent replaying against unfinalized roots.
+        if (block.number < sbtRootBlock[daoId] + finalityDepth) {
+            revert SbtRootNotFinalized();
+        }
 
         // === Proof Verification ===
 

@@ -54,6 +54,11 @@ describe("Bridge", function () {
       expect(await bridge.sbtRoots(daoId)).to.equal(newRoot);
     });
 
+    it("should enforce a configurable finality depth", async function () {
+      await bridge.setFinalityDepth(25n);
+      expect(await bridge.finalityDepth()).to.equal(25n);
+    });
+
     it("should revert if non-admin updates SBT root", async function () {
       await expect(
         bridge.connect(user).updateSbtRoot(daoId, sbtRoot)
@@ -186,6 +191,25 @@ describe("Bridge", function () {
           mockProof
         )
       ).to.be.revertedWithCustomError(bridge, "SbtRootNotSet");
+    });
+
+    it("should revert when provided sbtRoot is not finalized", async function () {
+      const mockProof = ethers.hexlify(ethers.randomBytes(256));
+      const newRoot = ethers.keccak256(ethers.toUtf8Bytes("fresh-root"));
+      await bridge.setFinalityDepth(12n);
+      await bridge.updateSbtRoot(daoId, newRoot);
+
+      await expect(
+        bridge.castVote(
+          daoId,
+          proposalId,
+          voteChoice,
+          nullifier + 10n,
+          voteRoot,
+          newRoot,
+          mockProof
+        )
+      ).to.be.revertedWithCustomError(bridge, "SbtRootNotFinalized");
     });
 
     it("should revert when provided sbtRoot mismatches", async function () {
