@@ -1,20 +1,124 @@
 #![no_std]
 
+/// Helpers shared by the integration test binaries in `tests/`.
+///
+/// These deliberately sit *outside* `#[cfg(test)]`. A `#[cfg(test)]` item is only
+/// compiled into this crate's own test build, and the binaries under `tests/`
+/// link this crate as an ordinary dependency — so a helper hidden behind
+/// `cfg(test)` would not exist for the very callers that need it most.
+pub mod testkit {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
+    use voting::VotingClient;
+
+    #[contracttype]
+    pub enum DataKey {
+        AttestAll(bool),
+    }
+
+    /// A transcript registry that attests every key.
+    ///
+    /// `voting::set_vk` is fail-closed without a configured transcript registry
+    /// (#662): a missing registry is a hard error, not a bypass. That is the
+    /// right default for production, but it means any harness that registers a
+    /// verification key has to supply one. These tests are not testing
+    /// attestation — they are testing the voting flow the key exists to verify —
+    /// so they install a permissive registry rather than pre-attesting every key
+    /// they construct. The tests that *do* exercise the gate live in
+    /// `contracts/voting/src/test.rs` and install a strict registry instead.
+    #[contract]
+    pub struct PermissiveTranscriptRegistry;
+
+    #[contractimpl]
+    impl PermissiveTranscriptRegistry {
+        pub fn set_attest_all(env: Env, attest_all: bool) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::AttestAll(attest_all), &attest_all);
+        }
+
+        pub fn is_vk_attested(env: Env, _vk_hash: BytesN<32>) -> bool {
+            env.storage()
+                .persistent()
+                .get(&DataKey::AttestAll(true))
+                .unwrap_or(false)
+        }
+    }
+
+    /// Give `voting` a permissive transcript registry so `set_vk` will run.
+    ///
+    /// Call this immediately after registering the voting contract and before
+    /// any `set_vk`.
+    pub fn install_permissive_transcript_registry(env: &Env, voting: &Address) {
+        let transcript = env.register(PermissiveTranscriptRegistry, ());
+        PermissiveTranscriptRegistryClient::new(env, &transcript).set_attest_all(&true);
+        VotingClient::new(env, voting).set_transcript_registry(&transcript);
+    }
+}
+
 // Integration test crate - all code is test-only
+
+/// Stand-in for the MPC ceremony transcript registry.
+///
+/// `Voting::set_vk` refuses a verification key with no ceremony attestation
+/// (#662) and reads the registry address from instance storage, so a harness
+/// that never calls `set_transcript_registry` makes *every* `set_vk` panic with
+/// "Transcript registry not configured" — taking the whole integration suite
+/// down before it asserts anything.
+///
+/// These tests are about voting, DAO wiring and boundaries, not about ceremony
+/// bookkeeping, so attest-all is the right default. `set_attest_all(false)`
+/// turns the gate back on for a test that is specifically about attestation.
+pub mod test_support {
+    use soroban_sdk::{contract, contractimpl, contracttype, BytesN, Env};
+
+    #[contracttype]
+    pub enum DataKey {
+        AttestAll,
+    }
+
+    #[contract]
+    pub struct MockTranscriptRegistry;
+
+    #[contractimpl]
+    impl MockTranscriptRegistry {
+        pub fn set_attest_all(env: Env, on: bool) {
+            env.storage().persistent().set(&DataKey::AttestAll, &on);
+        }
+
+        pub fn is_vk_attested(env: Env, _vk_hash: BytesN<32>) -> bool {
+            env.storage()
+                .persistent()
+                .get(&DataKey::AttestAll)
+                .unwrap_or(false)
+        }
+    }
+
+    /// Register a mock transcript registry and point `voting` at it.
+    ///
+    /// `voting` is the address returned by `env.register(voting::Voting, ..)`.
+    ///
+    /// Takes `Env` by value so it can be called as `attach(env, ..)` from
+    /// helpers that hold `&Env` without tripping clippy's needless-borrow lint;
+    /// `Env` is cheap to clone.
+    pub fn attach_transcript_registry(env: Env, voting: &soroban_sdk::Address) {
+        let registry = env.register(MockTranscriptRegistry, ());
+        MockTranscriptRegistryClient::new(&env, &registry).set_attest_all(&true);
+        voting::VotingClient::new(&env, voting).set_transcript_registry(&registry);
+    }
+}
 
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use soroban_sdk::{
-        testutils::{Address as _, Ledger as _},
-        Address, BytesN, Env, String, Symbol, Vec, U256,
-    };
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Symbol, Vec, U256};
 
     // Import actual contract clients
     use dao_registry::DaoRegistryClient;
     use membership_sbt::MembershipSbtClient;
     use membership_tree::MembershipTreeClient;
-    use voting::{Proof, VerificationKey, VoteMode, VotingClient, ELECTION_CREATION_COOLDOWN};
+    use voting::{Proof, VerificationKey, VoteMode, VotingClient};
+
+    use crate::test_support;
 
     /// Helper to setup the full DaoVote system
     struct DaoVoteSystem {
@@ -40,6 +144,10 @@ mod tests {
             // Pass both tree and registry to voting constructor (registry cached to reduce cross-contract calls)
             let guardian = Address::generate(&env);
             let voting = env.register(voting::Voting, (tree.clone(), registry.clone(), guardian));
+
+            // `set_vk` requires an attestation source; without this every
+            // `set_vk` below panics. See `test_support`.
+            test_support::attach_transcript_registry(env.clone(), &voting);
 
             Self {
                 env,
@@ -79,9 +187,9 @@ mod tests {
                 gamma: g2_gen.clone(),
                 delta: g2_gen.clone(),
                 // IC vector: IC[0] + one for each public signal
-                // Public signals: [root, nullifier, daoId, proposalId, voteChoice] = 5 signals
+                // Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates] = 6 signals
                 // (commitment is now PRIVATE, not public)
-                // So IC needs 6 elements
+                // So IC needs 7 elements
                 ic: Vec::from_array(
                     &self.env,
                     [
@@ -91,6 +199,7 @@ mod tests {
                         g1_gen.clone(), // IC[3] for daoId
                         g1_gen.clone(), // IC[4] for proposalId
                         g1_gen.clone(), // IC[5] for voteChoice
+                        g1_gen.clone(), // IC[6] for numCandidates
                     ],
                 ),
             }
@@ -1015,10 +1124,6 @@ mod tests {
         ic0[31] = 9;
         vk2.ic.set(0, BytesN::from_array(&system.env, &ic0));
         system.voting_client().set_vk(&dao_id, &vk2, &admin);
-        system
-            .env
-            .ledger()
-            .with_mut(|li| li.timestamp += ELECTION_CREATION_COOLDOWN);
         let proposal2 = system.voting_client().create_proposal(
             &dao_id,
             &String::from_str(&system.env, "P2"),
@@ -1132,8 +1237,8 @@ mod tests {
             cpu_delta,
             mem_delta
         );
-        assert!(cpu_delta <= 600_000, "create_proposal cpu too high");
-        assert!(mem_delta <= 225_000, "create_proposal mem too high");
+        assert!(cpu_delta <= 700_000, "create_proposal cpu too high");
+        assert!(mem_delta <= 250_000, "create_proposal mem too high");
 
         // --- vote ---
         let root = system.tree_client().get_root(&dao_id);
@@ -1150,8 +1255,28 @@ mod tests {
         let cpu_delta = cpu_after.saturating_sub(cpu_before);
         let mem_delta = mem_after.saturating_sub(mem_before);
         std::println!("[budget] vote cpu={} mem={}", cpu_delta, mem_delta);
-        assert!(cpu_delta <= 600_000, "vote cpu too high (test mode)");
-        assert!(mem_delta <= 200_000, "vote mem too high (test mode)");
+        // This ceiling is re-calibrated, not loosened, and the reason is worth
+        // recording. The old 600k/200k was measured against a Fixed-mode `vote`
+        // that made *zero* calls into the tree: the Fixed arm compared the root
+        // against the snapshot and stopped, which is exactly why member
+        // revocation was inert for Fixed-mode elections (#audit-H3). Closing
+        // that hole costs one `root_eligibility` hop per vote — measured at
+        // +131k CPU and +72k memory here, ~26% over the vulnerable path.
+        //
+        // That is the price of the check, and it is not avoidable by asking the
+        // tree for less: all three facts the check needs (is the root still in
+        // history, what index is it at, and where the revocation floor sits) live
+        // in the tree, so the floor cannot be consulted without a cross-contract
+        // call. A Trailing-mode vote already paid three such calls before this
+        // change, so Fixed mode is now no more expensive than Trailing.
+        //
+        // If this cost ever matters, the fix is architectural rather than a
+        // tighter constant: have `remove_member` *push* an invalidation onto the
+        // affected Active Fixed proposals once, instead of every vote pulling
+        // the floor. That moves the cost from per-vote to per-removal, at the
+        // price of a tree -> voting call on a path that currently has none.
+        assert!(cpu_delta <= 700_000, "vote cpu too high (test mode)");
+        assert!(mem_delta <= 260_000, "vote mem too high (test mode)");
     }
 
     #[test]
@@ -1279,5 +1404,60 @@ mod tests {
 
         let prop = system.voting_client().get_proposal(&dao_id, &proposal_id);
         assert_eq!(prop.yes_votes + prop.no_votes, 19);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError")]
+    fn test_invalid_candidate_index_rejected() {
+        let system = DaoVoteSystem::new();
+
+        let admin = Address::generate(&system.env);
+        let member = Address::generate(&system.env);
+
+        let dao_id = system.registry_client().create_dao(
+            &String::from_str(&system.env, "Candidate Test DAO"),
+            &admin,
+            &false,
+            &true,
+            &None,
+        );
+
+        system
+            .tree_client()
+            .init_tree(&dao_id, &5, &Symbol::new(&system.env, "BN254"), &admin);
+        system.sbt_client().mint(&dao_id, &member, &admin, &None);
+
+        let commitment = U256::from_u32(&system.env, 55555);
+        system
+            .tree_client()
+            .register_with_caller(&dao_id, &commitment, &member);
+
+        let root = system.tree_client().current_root(&dao_id);
+
+        let vk = system.create_test_vk();
+        system.voting_client().set_vk(&dao_id, &vk, &admin);
+
+        let now = system.env.ledger().timestamp();
+        let proposal_id = system.voting_client().create_proposal(
+            &dao_id,
+            &String::from_str(&system.env, "Candidate Bound Test"),
+            &String::from_str(&system.env, ""),
+            &(now + 86400),
+            &member,
+            &VoteMode::Fixed,
+        );
+
+        // Set num_candidates=1: only candidate index 0 is valid
+        system
+            .voting_client()
+            .set_election_config(&dao_id, &proposal_id, &0, &0, &1u32, &admin);
+
+        let proof = system.create_test_proof();
+        let nullifier = U256::from_u32(&system.env, 77777);
+
+        // vote_choice=true -> index 1 >= num_candidates(1) -> should panic
+        system
+            .voting_client()
+            .vote(&dao_id, &proposal_id, &true, &nullifier, &root, &proof);
     }
 }

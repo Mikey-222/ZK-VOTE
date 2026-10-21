@@ -18,6 +18,9 @@ use membership_sbt::MembershipSbtClient;
 use membership_tree::MembershipTreeClient;
 use voting::{VerificationKey, VoteMode, VotingClient};
 
+// `set_vk` needs an MPC attestation source; without one it panics before
+// the test asserts anything. See zkvote_integration_tests::test_support.
+use zkvote_integration_tests::test_support::attach_transcript_registry;
 fn setup_contracts(env: &Env) -> (Address, Address, Address, Address, Address) {
     // Deploy contracts using direct crate registration
     let registry_id = env.register(dao_registry::DaoRegistry, ());
@@ -31,6 +34,11 @@ fn setup_contracts(env: &Env) -> (Address, Address, Address, Address, Address) {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(env, &voting_id);
+
+    // Attestation source for `set_vk` (see test_support module docs).
+    attach_transcript_registry(env.clone(), &voting_id);
 
     let admin = Address::generate(env);
 
@@ -68,14 +76,15 @@ fn test_create_proposal_with_future_deadline() {
     let admin_commitment = U256::from_u32(&env, 12345);
     tree.register_with_caller(&dao_id, &admin_commitment, &admin);
 
-    // Set VK with proper admin verification (using mock VK - IC must have exactly 6 elements for vote circuit)
-    // 6 IC elements for 5 public signals: root, nullifier, daoId, proposalId, voteChoice
+    // Set VK with proper admin verification (using mock VK - IC must have exactly 7 elements for vote circuit)
+    // 7 IC elements for 6 public signals: root, nullifier, daoId, proposalId, voteChoice, numCandidates
     let mock_alpha = soroban_sdk::BytesN::from_array(&env, &[0u8; 64]);
     let mock_beta = soroban_sdk::BytesN::from_array(&env, &[0u8; 128]);
     let mock_gamma = soroban_sdk::BytesN::from_array(&env, &[0u8; 128]);
     let mock_delta = soroban_sdk::BytesN::from_array(&env, &[0u8; 128]);
     let mock_ic = soroban_sdk::vec![
         &env,
+        soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
         soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
         soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
         soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
@@ -143,14 +152,15 @@ fn test_create_proposal_with_past_deadline_fails() {
     let admin_commitment = U256::from_u32(&env, 12345);
     tree.register_with_caller(&dao_id, &admin_commitment, &admin);
 
-    // Set VK with proper admin verification (using mock VK - IC must have exactly 6 elements for vote circuit)
-    // 6 IC elements for 5 public signals: root, nullifier, daoId, proposalId, voteChoice
+    // Set VK with proper admin verification (using mock VK - IC must have exactly 7 elements for vote circuit)
+    // 7 IC elements for 6 public signals: root, nullifier, daoId, proposalId, voteChoice, numCandidates
     let mock_alpha = soroban_sdk::BytesN::from_array(&env, &[0u8; 64]);
     let mock_beta = soroban_sdk::BytesN::from_array(&env, &[0u8; 128]);
     let mock_gamma = soroban_sdk::BytesN::from_array(&env, &[0u8; 128]);
     let mock_delta = soroban_sdk::BytesN::from_array(&env, &[0u8; 128]);
     let mock_ic = soroban_sdk::vec![
         &env,
+        soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
         soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
         soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
         soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
@@ -220,14 +230,15 @@ fn test_create_proposal_with_no_deadline() {
     let admin_commitment = U256::from_u32(&env, 12345);
     tree.register_with_caller(&dao_id, &admin_commitment, &admin);
 
-    // Set VK with proper admin verification (using mock VK - IC must have exactly 6 elements for vote circuit)
-    // 6 IC elements for 5 public signals: root, nullifier, daoId, proposalId, voteChoice
+    // Set VK with proper admin verification (using mock VK - IC must have exactly 7 elements for vote circuit)
+    // 7 IC elements for 6 public signals: root, nullifier, daoId, proposalId, voteChoice, numCandidates
     let mock_alpha = soroban_sdk::BytesN::from_array(&env, &[0u8; 64]);
     let mock_beta = soroban_sdk::BytesN::from_array(&env, &[0u8; 128]);
     let mock_gamma = soroban_sdk::BytesN::from_array(&env, &[0u8; 128]);
     let mock_delta = soroban_sdk::BytesN::from_array(&env, &[0u8; 128]);
     let mock_ic = soroban_sdk::vec![
         &env,
+        soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
         soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
         soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
         soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),

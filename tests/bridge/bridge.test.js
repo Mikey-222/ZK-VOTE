@@ -66,27 +66,32 @@ describe("Bridge Circuit", () => {
   });
 
   test("generates valid proof with mocked SBT state", async () => {
-    // Setup parameters
+    // Setup parameters — leaf/nullifier match bridge.circom (#649)
     const secret = 12345n;
     const salt = 67890n;
     const daoId = 1n;
     const proposalId = 1n;
     const voteChoice = 1n;
+    const chainId = 1n;
     const sbtContractAddr = 99999n;
     const memberAddr = 88888n;
     const levels = 4; // Small tree for testing
 
-    // Compute commitment
-    const commitment = poseidon([secret, salt]);
+    // Voting leaf binds memberAddr: Poseidon(secret, salt, memberAddr)
+    const commitment = poseidon([secret, salt, memberAddr]);
 
-    // Build voting Merkle tree
-    const votingLeaves = [commitment, poseidon([111n, 222n]), poseidon([333n, 444n])];
+    const makeLeaf = (s, sa, m) => poseidon([s, sa, m]);
+    const votingLeaves = [
+      commitment,
+      makeLeaf(111n, 222n, 1n),
+      makeLeaf(444n, 555n, 2n),
+    ];
     const votingTree = await buildMerkleTree(poseidon, votingLeaves, levels);
     const voteRoot = votingTree.root;
     const votingProof = votingTree.getProof(0);
 
-    // Compute nullifier
-    const nullifier = poseidon([secret, daoId, proposalId]);
+    // Nullifier binds chainId: Poseidon(secret, daoId, proposalId, chainId)
+    const nullifier = poseidon([secret, daoId, proposalId, chainId]);
 
     // Build SBT state tree
     const sbtLeaf = poseidon([sbtContractAddr, memberAddr, daoId, 1n]); // isActive = 1
@@ -106,6 +111,7 @@ describe("Bridge Circuit", () => {
       voteChoice: voteChoice.toString(),
       voteRoot: voteRoot.toString(),
       sbtRoot: sbtRoot.toString(),
+      chainId: chainId.toString(),
       // Private inputs
       secret: secret.toString(),
       salt: salt.toString(),
@@ -123,12 +129,14 @@ describe("Bridge Circuit", () => {
       "build/bridge_final.zkey"
     );
 
-    // Verify public signals match expected
+    // Verify public signals match expected order including memberAddr + chainId
     expect(publicSignals[0]).toBe(sbtContractAddr.toString());
+    expect(publicSignals[1]).toBe(memberAddr.toString());
     expect(publicSignals[2]).toBe(daoId.toString());
     expect(publicSignals[3]).toBe(proposalId.toString());
     expect(publicSignals[4]).toBe(nullifier.toString());
     expect(publicSignals[5]).toBe(voteChoice.toString());
+    expect(publicSignals[8]).toBe(chainId.toString());
 
     // Verify proof
     const vKey = require("../../../circuits/build/verification_key.json");
@@ -139,29 +147,31 @@ describe("Bridge Circuit", () => {
   test("rejects invalid vote choice", async () => {
     const poseidon = await buildPoseidon();
     const levels = 4;
+    const memberAddr = 2n;
 
     const secret = 111n;
     const salt = 222n;
-    const commitment = poseidon([secret, salt]);
+    const commitment = poseidon([secret, salt, memberAddr]);
 
     const votingLeaves = [commitment];
     const votingTree = await buildMerkleTree(poseidon, votingLeaves, levels);
     const votingProof = votingTree.getProof(0);
 
-    const sbtLeaf = poseidon([1n, 2n, 3n, 1n]);
+    const sbtLeaf = poseidon([1n, memberAddr, 3n, 1n]);
     const sbtLeaves = [sbtLeaf];
     const sbtTree = await buildMerkleTree(poseidon, sbtLeaves, levels);
     const sbtProof = sbtTree.getProof(0);
 
     const input = {
       sbtContractAddr: "1",
-      memberAddr: "2",
+      memberAddr: memberAddr.toString(),
       daoId: "3",
       proposalId: "1",
       nullifier: "12345",
       voteChoice: "2", // Invalid: not 0 or 1
       voteRoot: votingTree.root.toString(),
       sbtRoot: sbtTree.root.toString(),
+      chainId: "1",
       secret: secret.toString(),
       salt: salt.toString(),
       votingPathElements: votingProof.pathElements.map(String),
@@ -183,17 +193,18 @@ describe("Bridge Circuit", () => {
   test("rejects wrong SBT leaf (inactive member)", async () => {
     const poseidon = await buildPoseidon();
     const levels = 4;
+    const memberAddr = 2n;
 
     const secret = 111n;
     const salt = 222n;
-    const commitment = poseidon([secret, salt]);
+    const commitment = poseidon([secret, salt, memberAddr]);
 
     const votingLeaves = [commitment];
     const votingTree = await buildMerkleTree(poseidon, votingLeaves, levels);
     const votingProof = votingTree.getProof(0);
 
     // SBT leaf with isActive = 0 (revoked)
-    const sbtLeaf = poseidon([1n, 2n, 3n, 0n]);
+    const sbtLeaf = poseidon([1n, memberAddr, 3n, 0n]);
     const sbtLeaves = [sbtLeaf];
     const sbtTree = await buildMerkleTree(poseidon, sbtLeaves, levels);
     const sbtProof = sbtTree.getProof(0);
@@ -201,13 +212,14 @@ describe("Bridge Circuit", () => {
     // Try to prove with isActive = 1 (but tree has isActive = 0)
     const input = {
       sbtContractAddr: "1",
-      memberAddr: "2",
+      memberAddr: memberAddr.toString(),
       daoId: "3",
       proposalId: "1",
       nullifier: "12345",
       voteChoice: "1",
       voteRoot: votingTree.root.toString(),
       sbtRoot: sbtTree.root.toString(),
+      chainId: "1",
       secret: secret.toString(),
       salt: salt.toString(),
       votingPathElements: votingProof.pathElements.map(String),
@@ -215,7 +227,7 @@ describe("Bridge Circuit", () => {
       sbtPathElements: sbtProof.pathElements.map(String),
       sbtPathIndices: sbtProof.pathIndices.map(String),
       // Prover tries to use isActive = 1, but tree has 0
-      sbtLeaf: poseidon([1n, 2n, 3n, 1n]).toString(),
+      sbtLeaf: poseidon([1n, memberAddr, 3n, 1n]).toString(),
     };
 
     await expect(

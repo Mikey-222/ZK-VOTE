@@ -25,7 +25,7 @@ When a proposal (election) is created, the current ledger sequence is recorded a
 **Key components**:
 - `BalanceSnapshotInfo` struct stores `snapshot_ledger` (ledger sequence) and `timestamp`
 - `ProposalInfo.snapshot_ledger` field records when the proposal was created
-- `create_balance_snapshot()` captures the snapshot
+- `create_balance_snapshot()` captures the snapshot (DAO admin only)
 - `get_balance_snapshot()` retrieves the snapshot for verification
 
 ### 2. Voter Eligibility at Snapshot Time
@@ -69,7 +69,10 @@ TWAB provides Sybil resistance by measuring the average balance over time, not j
 
 **How it works**:
 - `BalanceCheckpoint` stores (dao_id, address, ledger_seq) -> balance
-- Token contracts call `record_balance_checkpoint()` when balances change
+- The DAO admin calls `record_balance_checkpoint()` when balances change. This is
+  deliberately admin-gated rather than permissionless: checkpoints are the sole
+  input to the TWAB, so an unauthenticated caller could forge any voter's
+  balance history and defeat the flash-loan check entirely.
 - `get_time_weighted_average_balance()` computes the average across a ledger range
 - TWAB = Σ(balance_i × duration_i) / total_duration
 
@@ -86,10 +89,17 @@ During an active election, registered voters enter a transfer cooldown that prev
 - Having their SBT revoked to avoid vote accountability
 
 **Cooldown enforcement**:
-- `set_voter_cooldown()` sets a 7-day cooldown when a voter registers/votes
+- `set_voter_cooldown(dao_id, voter, caller)` sets a 7-day cooldown when a voter
+  registers/votes. `caller` must be the voter themselves or the DAO admin
 - `is_in_transfer_cooldown()` is called by token contracts before allowing transfers
 - `leave()` in SBT contract checks cooldown before allowing departure
-- Cooldown is cleared when the election ends via `clear_voter_cooldown()`
+- Cooldown is cleared when the election ends via `clear_voter_cooldown(dao_id, voter, caller)`,
+  under the same self-or-admin rule
+- The SBT contract's `set_election_cooldown()` / `clear_election_cooldown()` /
+  `set_in_active_election()` follow the same self-or-admin rule. These gate
+  `leave()`, so leaving them permissionless would let anyone lock a member out
+  of the DAO permanently (`cooldown_end = u64::MAX`) or drop the barrier that
+  stops a vote -> leave -> rejoin cycle inside one election
 
 ## Election Randomness
 
@@ -139,13 +149,16 @@ fn transfer(..., from: Address, ...) {
     // Proceed with transfer
 }
 
-// Record balance checkpoints for TWAB
-fn after_balance_change(..., voter: Address, new_balance: i128) {
+// Record balance checkpoints for TWAB. Admin-gated: pass the DAO admin as the
+// trailing `admin` argument and have it `require_auth()`.
+fn after_balance_change(..., admin: Address, voter: Address, new_balance: i128) {
     let voting_contract: Address = ...;
+    admin.require_auth();
     env.invoke_contract(
         &voting_contract,
         &Symbol::new(&env, "record_balance_checkpoint"),
-        vec![&env, dao_id.into_val(&env), voter.into_val(&env), new_balance.into_val(&env)],
+        vec![&env, dao_id.into_val(&env), voter.into_val(&env),
+             new_balance.into_val(&env), admin.into_val(&env)],
     );
 }
 ```
@@ -158,7 +171,7 @@ fn create_token_gated_proposal(...) {
     let proposal_id = voting_contract.create_proposal(...);
     
     // Create balance snapshot
-    voting_contract.create_balance_snapshot(dao_id, proposal_id);
+    voting_contract.create_balance_snapshot(dao_id, proposal_id, admin);
     
     // Configure token-gating
     voting_contract.set_election_config(
@@ -187,7 +200,7 @@ fn vote_with_token_gate(..., voter, proposal_id) {
     }
     
     // Set cooldown to prevent transfer after voting
-    voting_contract.set_voter_cooldown(dao_id, voter);
+    voting_contract.set_voter_cooldown(dao_id, voter, voter);
     
     // Submit vote
     voting_contract.vote(...);
@@ -220,6 +233,41 @@ fn vote_with_token_gate(..., voter, proposal_id) {
 | Voting | `InsufficientSnapshotBalance` | 28 | Balance at snapshot time below minimum |
 | SBT | `CooldownActive` | 6 | Cannot leave DAO during active election |
 
+## Poseidon Hash Parameters
+
+Every commitment, nullifier and Merkle node in the protocol is a Poseidon hash
+over the BN254 scalar field, so the parameter set is part of the protocol's
+security argument rather than an implementation detail.
+
+| Parameter | Value |
+|-----------|-------|
+| Field | BN254 `Fr` (254-bit prime) |
+| S-box | `x^5` |
+| Full rounds `R_F` | 8 |
+| Partial rounds `R_P` | 57 for `t=3`, 56 for `t=4`, 60 for `t=5` |
+| Security level | 128 bits |
+
+State widths in use: `t=3` for Merkle node and leaf-domain hashing (the only
+width the on-chain contract carries parameters for), `t=4` for the vote
+nullifier `Poseidon(secret, daoId, proposalId)`, `t=5` for the identity
+commitment `Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)`.
+
+These values are not chosen; they are derived. The round constants come from
+the Grain LFSR specified in Grassi et al. (USENIX Security 2021, Appendix F),
+seeded only by the parameters above, and the MDS matrix is the Cauchy matrix
+built from the continuation of that same stream. `circuits/utils/poseidon_param_audit.js`
+re-derives both from the seed, re-runs the reference generator's three
+matrix-security tests (no invariant subspace, no subspace trail, no iterated
+subspace trail) against the shipped values, and checks `R_F`/`R_P` against the
+published statistical, interpolation and Gröbner-basis bounds — including with
+the designers' security margin stripped off, to show how much margin remains.
+`circuits/poseidon_params.test.js` runs all of it in CI, and the on-chain
+vendored copy in `contracts/membership-tree/src/poseidon_params.rs` is pinned
+to the same derivation by a shared SHA-256 digest.
+
+Full detail, including the current cryptanalysis picture and why Poseidon2 is
+not adopted, is in [docs/poseidon-parameters.md](./poseidon-parameters.md).
+
 ## Security Considerations
 
 1. **Ledger sequence vs timestamp**: Snapshots use ledger sequence numbers which are monotonically increasing and cannot be manipulated. Timestamps are used only for cooldown expiry.
@@ -229,3 +277,78 @@ fn vote_with_token_gate(..., voter, proposal_id) {
 3. **Cooldown duration**: The 7-day cooldown is a default that should be adjusted based on the election duration. Short elections may use shorter cooldowns; long elections should extend it.
 
 4. **Gas costs**: TWAB computation iterates over checkpoints within a range. For frequently-traded tokens, this could be expensive. Consider limiting the checkpoint range.
+
+## Proof Serialization Format (ZKV1)
+
+The ZK proof pipeline (snarkjs JSON &rarr; backend `stellar.ts` &rarr; Soroban `Proof`/`BytesN<256>`) previously converted between representations without a single documented byte layout. `ZKV1` is the canonical, versioned wire format used to move a Groth16 proof between components, implemented identically in:
+
+- Rust: `contracts/zkvote-groth16/src/serialization.rs` (`serialize_proof` / `deserialize_proof`)
+- TypeScript: `backend/src/services/proofSerialization.ts` (`serializeProof` / `deserializeProof`)
+
+### Byte layout
+
+```
+[ version (1B) | curve_id (1B) | A_x (32B) | A_y (32B)
+  | B_x1 (32B) | B_x2 (32B) | B_y1 (32B) | B_y2 (32B)
+  | C_x (32B) | C_y (32B) ]
+```
+
+| Field | Size | Description |
+|-------|------|--------------|
+| `version` | 1 byte | Format version, currently `0x01`. Bumped on any incompatible layout change so old/new decoders can safely reject data they don't understand. |
+| `curve_id` | 1 byte | `0x00` = BN254, `0x01` = BLS12-381. |
+| `A` | 64 bytes | G1 affine point, `X \|\| Y`, each coordinate 32-byte **big-endian**. |
+| `B` | 128 bytes | G2 affine point, `X_c1 \|\| X_c0 \|\| Y_c1 \|\| Y_c0`, each 32-byte big-endian (matches the existing `G2Hex` convention in `backend/src/types/index.ts`). |
+| `C` | 64 bytes | G1 affine point, same layout as `A`. |
+
+Total length: `1 + 1 + 64 + 128 + 64 = 258` bytes.
+
+**Endianness**: all field-element bytes are big-endian, matching `hexToBytes`/`proofToScVal` in `backend/src/services/stellar.ts` and the `BytesN<64>`/`BytesN<128>` big-endian convention already used by the contract.
+
+### Example proof vector (interoperability fixture)
+
+For cross-implementation testing (see `backend/test/proof-serialization.test.js`), the following degenerate-but-well-formed vector round-trips through both the Rust and TypeScript implementations:
+
+```
+a = 0x01 repeated 64 times
+b = 0x02 repeated 128 times
+c = 0x03 repeated 64 times
+version = 0x01, curve_id = 0x00 (BN254)
+
+ZKV1 bytes (hex) = 0x0100 + ("01" * 64) + ("02" * 128) + ("03" * 64)
+```
+
+### Relationship to `proofToScVal`
+
+`backend/src/services/stellar.ts::proofToScVal` continues to build the Soroban `Map { a, b, c }` argument the deployed `Groth16Curve::verify` entry point expects — that map's field order and point sizes are exactly the `A`/`B`/`C` slice of the ZKV1 format (i.e. ZKV1 bytes `[2..258]`). `ZKV1` adds the explicit version/curve header on top so a proof can be stored, logged, or handed to an external auditor as a single self-describing blob without needing out-of-band knowledge of which curve or format revision produced it. `proofToScVal`'s existing point-at-infinity and length validation is reused by `serializeProof`, so a proof that would be rejected by the contract call path is also rejected by the ZKV1 encoder.
+
+### Scope note
+
+This format currently covers the BN254 G1&times;G2&times;G1 proof shape used by the single on-chain `Proof` type (`contracts/zkvote-groth16/src/lib.rs`). The BLS12-381 curve id byte is defined and round-trip tested, but `ProofBls381` uses different point sizes (`BytesN<96>`/`BytesN<192>`); encoding those is a straightforward follow-up (a `curve_id`-dependent length) left out of this change to keep the initial format landing minimal and unambiguous for the BN254 path that is actually deployed today.
+
+---
+
+## 4. Cross-DAO Identity Derivation & Linkability Prevention
+
+### Problem Statement: Cross-DAO Secret Reuse
+If voters reuse raw `(secret, salt, blindingFactor)` credentials across multiple DAOs:
+1. **Commitment Correlation**: `Poseidon(DOMAIN_TAG, secret, salt, blinding)` produces identical leaf values across different DAO Merkle trees, publicly exposing that the same voter belongs to each of those DAOs.
+2. **Nullifier & Compromise Blast Radius**: While nullifiers `Poseidon(secret, daoId, proposalId)` incorporate `daoId`, an admin compromising or observing one DAO's secret preimage can test nullifiers across other DAOs or link timing and behavioral footprints.
+
+### The Canonical Derivation Standard
+To ensure absolute domain separation and unlinkability, credentials must be derived per DAO using a cryptographically isolated Key Derivation Function (KDF):
+
+```text
+secret_dao   = BigInt(SHA-256("zkvote:secret:"   || daoId || masterSeed))
+salt_dao     = BigInt(SHA-256("zkvote:salt:"     || daoId || masterSeed))
+blinding_dao = BigInt(SHA-256("zkvote:blinding:" || daoId || masterSeed))
+```
+
+Each derived value is reduced into the BN254 scalar field ($< r$). The resulting commitment:
+$$\text{Commitment}_{\text{DAO}} = \text{Poseidon}(\text{DOMAIN\_TAG}, \text{secret}_{\text{dao}}, \text{salt}_{\text{dao}}, \text{blinding}_{\text{dao}})$$
+is mathematically independent between distinct `daoId` values.
+
+### Migration & Rotation
+- Members rotating credentials generate new per-DAO derived identities without carrying over linkability.
+- Recovery UX utilizes deterministic wallet signatures bound to `daoId` via `generateZKCredentials(kit, daoId)` or `derivePerDaoCredentials(masterSecret, daoId)`.
+- Compromising any single DAO admin or registry node bounds the blast radius exclusively to that single DAO, preserving anonymity across the voter's broader governance activity.

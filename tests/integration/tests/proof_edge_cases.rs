@@ -16,6 +16,9 @@ use membership_sbt::MembershipSbtClient;
 use membership_tree::MembershipTreeClient;
 use voting::{Proof, VerificationKey, VoteMode, VotingClient};
 
+// `set_vk` needs an MPC attestation source; without one it panics before
+// the test asserts anything. See zkvote_integration_tests::test_support.
+use zkvote_integration_tests::test_support::attach_transcript_registry;
 // Local mirror of the voting contract's DataKey for storage surgery in tests
 #[contracttype]
 #[derive(Clone)]
@@ -45,7 +48,7 @@ fn hex_str_to_u256(env: &Env, hex: &str) -> U256 {
 }
 
 // Real VK from circuits/build/verification_key_soroban_be.json
-// 6 IC elements for 5 public signals: root, nullifier, daoId, proposalId, voteChoice
+// 7 IC elements for 6 public signals: root, nullifier, daoId, proposalId, voteChoice, numCandidates
 // (commitment is now a PRIVATE signal for improved privacy)
 fn get_real_vk(env: &Env) -> VerificationKey {
     let mut ic = SdkVec::new(env);
@@ -55,7 +58,7 @@ fn get_real_vk(env: &Env) -> VerificationKey {
     ic.push_back(hex_to_bytes(env, "2a7f1a9e3de9411015b1c5652856bc7a467110344153252026c44ca55f5dca632f0db38e6d0268092cba5ea0b5db9610e45bd8b4aac852527aeb6323c8f09804"));
     ic.push_back(hex_to_bytes(env, "09c5b9b793a6f8098f0ac918aa0a19a75b74e7f1428f726194a48af37da8ac14122edc5b3704f106fa3c095ac74f524032e460179c3e8ecd562ef050c884336a"));
     ic.push_back(hex_to_bytes(env, "143c06565aad1cacd0ddbc0cfc6dd131c70392d29c16d8c80ed7f62ada52587b13e189e68fe2fe8806b272da3c5762a18b23680cdeda63faef014b7dd6806f21"));
-    // Removed 7th IC element (was for commitment public signal)
+    ic.push_back(hex_to_bytes(env, "143c06565aad1cacd0ddbc0cfc6dd131c70392d29c16d8c80ed7f62ada52587b13e189e68fe2fe8806b272da3c5762a18b23680cdeda63faef014b7dd6806f21"));
 
     VerificationKey {
         alpha: hex_to_bytes(env, "2d4d9aa7e302d9df41749d5507949d05dbea33fbb16c643b22f599a2be6df2e214bedd503c37ceb061d8ec60209fe345ce89830a19230301f076caff004d1926"),
@@ -66,7 +69,7 @@ fn get_real_vk(env: &Env) -> VerificationKey {
     }
 }
 
-// Real proof generated for updated circuit (5 public signals)
+// Real proof generated for updated circuit (6 public signals)
 // secret=123456789, salt=987654321, daoId=1, proposalId=1, voteChoice=1
 // commitment at index 0 in depth-18 Merkle tree
 fn get_real_proof(env: &Env) -> Proof {
@@ -106,7 +109,7 @@ fn get_corrupted_proof(env: &Env) -> Proof {
 }
 
 // Different VK (valid curve points but different from real VK)
-// 6 IC elements for 5 public signals (commitment removed)
+// 7 IC elements for 6 public signals (commitment removed, numCandidates added)
 fn get_different_vk(env: &Env) -> VerificationKey {
     // Use the real VK but modify alpha point slightly
     let mut ic = SdkVec::new(env);
@@ -116,7 +119,7 @@ fn get_different_vk(env: &Env) -> VerificationKey {
     ic.push_back(hex_to_bytes(env, "2a7f1a9e3de9411015b1c5652856bc7a467110344153252026c44ca55f5dca632f0db38e6d0268092cba5ea0b5db9610e45bd8b4aac852527aeb6323c8f09804"));
     ic.push_back(hex_to_bytes(env, "09c5b9b793a6f8098f0ac918aa0a19a75b74e7f1428f726194a48af37da8ac14122edc5b3704f106fa3c095ac74f524032e460179c3e8ecd562ef050c884336a"));
     ic.push_back(hex_to_bytes(env, "143c06565aad1cacd0ddbc0cfc6dd131c70392d29c16d8c80ed7f62ada52587b13e189e68fe2fe8806b272da3c5762a18b23680cdeda63faef014b7dd6806f21"));
-    // Removed 7th IC element (was for commitment public signal)
+    ic.push_back(hex_to_bytes(env, "143c06565aad1cacd0ddbc0cfc6dd131c70392d29c16d8c80ed7f62ada52587b13e189e68fe2fe8806b272da3c5762a18b23680cdeda63faef014b7dd6806f21"));
 
     VerificationKey {
         // Modified alpha (different x coordinate)
@@ -144,6 +147,11 @@ fn setup_contracts(env: &Env) -> (Address, Address, Address, Address, Address) {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(env, &voting_id);
+
+    // Attestation source for `set_vk` (see test_support module docs).
+    attach_transcript_registry(env.clone(), &voting_id);
 
     let admin = Address::generate(env);
 

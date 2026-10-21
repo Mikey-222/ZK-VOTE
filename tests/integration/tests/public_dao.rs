@@ -14,6 +14,9 @@ use membership_sbt::MembershipSbtClient;
 use membership_tree::MembershipTreeClient;
 use voting::{VoteMode, VotingClient};
 
+// `set_vk` needs an MPC attestation source; without one it panics before
+// the test asserts anything. See zkvote_integration_tests::test_support.
+use zkvote_integration_tests::test_support::attach_transcript_registry;
 fn setup_contracts(env: &Env) -> (Address, Address, Address, Address, Address) {
     // Deploy contracts
     let registry_id = env.register(dao_registry::DaoRegistry, ());
@@ -27,6 +30,11 @@ fn setup_contracts(env: &Env) -> (Address, Address, Address, Address, Address) {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(env, &voting_id);
+
+    // Attestation source for `set_vk` (see test_support module docs).
+    attach_transcript_registry(env.clone(), &voting_id);
 
     let admin = Address::generate(env);
 
@@ -80,7 +88,8 @@ fn create_test_vk(env: &Env) -> voting::VerificationKey {
             g1_gen.clone(),
             g1_gen.clone(),
             g1_gen.clone(),
-            g1_gen, // 6 elements for 5 public signals + 1
+            g1_gen.clone(),
+            g1_gen, // 7 elements for 6 public signals + 1
         ],
     }
 }
